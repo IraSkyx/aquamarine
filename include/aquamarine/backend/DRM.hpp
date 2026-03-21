@@ -441,7 +441,8 @@ namespace Aquamarine {
 
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
 
-        bool                                                          atomic = false;
+        bool                                                          atomic       = false;
+        bool                                                          needsCpuBlit = false;
 
         struct {
             Hyprutils::Math::Vector2D cursorSize;

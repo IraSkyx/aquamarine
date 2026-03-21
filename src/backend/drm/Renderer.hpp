@@ -156,6 +156,8 @@ namespace Aquamarine {
         CGLTex                                        glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
         void                                          readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out);
 
+        bool readBufferRaw(Hyprutils::Memory::CSharedPointer<IBuffer> buf, uint8_t* dst, uint32_t dstStride, int height);
+
         Hyprutils::Memory::CWeakPointer<CDRMRenderer> self;
         std::vector<SGLFormat>                        formats;
 

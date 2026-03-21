@@ -807,6 +807,68 @@ void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
 }
 
+bool CDRMRenderer::readBufferRaw(Hyprutils::Memory::CSharedPointer<IBuffer> buf, uint8_t* dst, uint32_t dstStride, int height) {
+    CEglContextGuard eglContext(*this);
+
+    auto att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
+    if (!att || att->renderer != self) {
+        att = makeShared<CDRMRendererBufferOutputAttachment>(self, nullptr, 0, 0);
+        buf->attachments.add(att);
+    }
+
+    const auto& dma = buf->dmabuf();
+    if (!att->eglImage) {
+        att->eglImage = createEGLImage(dma);
+        if (att->eglImage == EGL_NO_IMAGE_KHR) {
+            backend->log(AQ_LOG_ERROR, std::format("EGL (readBufferRaw): createEGLImage failed: {}", eglGetError()));
+            return false;
+        }
+
+        GLCALL(glGenRenderbuffers(1, &att->rbo));
+        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, att->rbo));
+        GLCALL(proc.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, (GLeglImageOES)att->eglImage));
+        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));
+
+        GLCALL(glGenFramebuffers(1, &att->fbo));
+        GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
+        GLCALL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, att->rbo));
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            backend->log(AQ_LOG_ERROR, std::format("EGL (readBufferRaw): FBO incomplete: {}", glGetError()));
+            return false;
+        }
+    }
+
+    int rows  = std::min(height, (int)dma.size.y);
+    int width = dma.size.x;
+
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
+
+    if (exts.EXT_read_format_bgra) {
+        GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4));
+        GLCALL(glReadPixels(0, 0, width, rows, GL_BGRA_EXT, GL_UNSIGNED_BYTE, dst));
+        GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, 0));
+    } else {
+        uint32_t             srcStride = width * 4;
+        std::vector<uint8_t> tmp(srcStride * rows);
+        GLCALL(glReadPixels(0, 0, width, rows, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data()));
+
+        for (int y = 0; y < rows; ++y) {
+            auto*       dstRow = dst + (uint64_t)y * dstStride;
+            const auto* srcRow = tmp.data() + (uint64_t)y * srcStride;
+            for (int x = 0; x + 3 < (int)srcStride; x += 4) {
+                dstRow[x + 0] = srcRow[x + 2];
+                dstRow[x + 1] = srcRow[x + 1];
+                dstRow[x + 2] = srcRow[x + 0];
+                dstRow[x + 3] = 0xFF;
+            }
+        }
+    }
+
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    return true;
+}
+
 void CDRMRenderer::waitOnSync(int fd) {
     TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (waitOnSync): attempting to wait on fd {}", fd)));
 

@@ -133,6 +133,10 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
         return true;
 
     if (int ret = drmModePageFlip(connector->backend->gpu->fd, connector->crtc->id, mainFB ? mainFB->id : -1, data.flags, &connector->pendingPageFlip); ret) {
+        if (data.modeset) {
+            connector->backend->backend->log(AQ_LOG_DEBUG, "legacy drm: page flip after modeset failed, buffer already displayed by drmModeSetCrtc");
+            return true;
+        }
         connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModePageFlip failed: {}", strerror(-ret)));
         return false;
     }

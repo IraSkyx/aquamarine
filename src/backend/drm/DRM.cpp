@@ -641,6 +641,9 @@ bool Aquamarine::CDRMBackend::updateSecondaryRendererState() {
         if (rendererState.renderer && rendererState.allocator)
             return true;
 
+        if (needsCpuBlit)
+            return true;
+
         backend->log(AQ_LOG_DEBUG, std::format("drm: Initializing secondary renderer on {}, has enabled outputs", gpu->path));
         return initMgpu();
     }
@@ -662,6 +665,7 @@ bool Aquamarine::CDRMBackend::updateSecondaryRendererState() {
 
     rendererState.renderer.reset();
     rendererState.allocator.reset();
+    needsCpuBlit = false;
 
     return true;
 }
@@ -784,8 +788,6 @@ bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBacken
     gpuName = drmName;
 
     auto drmVerName = drmVer->name ? drmVer->name : "unknown";
-    if (std::string_view(drmVerName) == "evdi")
-        primary = {};
 
     backend->log(AQ_LOG_DEBUG,
                  std::format("drm: Starting backend for {}, with driver {}{}", drmName ? drmName : "unknown", drmVerName,
@@ -1907,54 +1909,112 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         SP<CDRMFB> drmFB;
 
         if (backend->shouldBlit()) {
-            if (!backend->rendererState.renderer) {
+            if (!backend->rendererState.renderer && !backend->needsCpuBlit) {
                 backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
-                if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
-                    backend->backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for blitting");
-                    return false;
+                if (!backend->initMgpu() || !backend->rendererState.renderer) {
+                    backend->backend->log(AQ_LOG_DEBUG, "drm: Secondary GPU has no GL renderer, falling back to CPU blit");
+                    backend->needsCpuBlit = true;
                 }
             }
 
-            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
+            if (backend->needsCpuBlit) {
+                auto primaryRenderer = backend->primary ? backend->primary->rendererState.renderer : nullptr;
+                if (!primaryRenderer) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit requires a primary renderer");
+                    return false;
+                }
 
-            if (!mgpu.swapchain) {
-                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
-                mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
-            }
+                if (!backend->dumbAllocator) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit requires a dumb allocator");
+                    return false;
+                }
 
-            auto OPTIONS = swapchain->currentOptions();
-            auto bufDma  = STATE.buffer->dmabuf();
-            OPTIONS.size = STATE.buffer->size;
-            if (OPTIONS.format == DRM_FORMAT_INVALID)
-                OPTIONS.format = bufDma.format;
-            OPTIONS.multigpu = false; // this is not a shared swapchain, and additionally, don't make it linear, nvidia would be mad
-            OPTIONS.cursor   = false;
-            OPTIONS.scanout  = true;
-            if (!mgpu.swapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
-                return false;
-            }
+                if (!mgpu.swapchain)
+                    mgpu.swapchain = CSwapchain::create(backend->dumbAllocator, backend.lock());
 
-            auto                         NEWAQBUF = mgpu.swapchain->next(nullptr);
-            SP<Aquamarine::CDRMRenderer> primaryRenderer;
-            if (backend->primary)
-                primaryRenderer = backend->primary->rendererState.renderer;
-            auto blitResult = backend->rendererState.renderer->blit(
-                STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
-            if (!blitResult.success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
-                return false;
-            }
+                SSwapchainOptions OPTIONS;
+                OPTIONS.length   = 3;
+                OPTIONS.size     = STATE.buffer->size;
+                OPTIONS.format   = DRM_FORMAT_XRGB8888;
+                OPTIONS.scanout  = true;
+                OPTIONS.cursor   = false;
+                OPTIONS.multigpu = false;
+                if (!mgpu.swapchain->reconfigure(OPTIONS)) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit swapchain failed to reconfigure");
+                    return false;
+                }
 
-            // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
-            // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
-            static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
-            if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
-                state->setExplicitInFence(blitResult.syncFD.value());
-            else
+                auto NEWAQBUF = mgpu.swapchain->next(nullptr);
+                if (!NEWAQBUF) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit swapchain returned no buffer");
+                    return false;
+                }
+
+                auto [dumbData, dumbFmt, dumbLen] = NEWAQBUF->beginDataPtr(0);
+                if (!dumbData) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit failed to map dumb buffer");
+                    return false;
+                }
+
+                auto     dumbDma   = NEWAQBUF->dmabuf();
+                uint32_t dstStride = dumbDma.strides.at(0);
+                int      rows      = (int)dumbDma.size.y;
+
+                // synchronous readback: must complete before commit returns so the
+                // compositor is free to reuse STATE.buffer for the next frame.
+                bool ok = primaryRenderer->readBufferRaw(STATE.buffer, dumbData, dstStride, rows);
+
+                NEWAQBUF->endDataPtr();
+
+                if (!ok) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU blit readback failed");
+                    return false;
+                }
+
                 state->setExplicitInFence(-1);
+                drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr);
+            } else {
+                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
 
-            drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
+                if (!mgpu.swapchain) {
+                    TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
+                    mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
+                }
+
+                auto OPTIONS = swapchain->currentOptions();
+                auto bufDma  = STATE.buffer->dmabuf();
+                OPTIONS.size = STATE.buffer->size;
+                if (OPTIONS.format == DRM_FORMAT_INVALID)
+                    OPTIONS.format = bufDma.format;
+                OPTIONS.multigpu = false; // this is not a shared swapchain, and additionally, don't make it linear, nvidia would be mad
+                OPTIONS.cursor   = false;
+                OPTIONS.scanout  = true;
+                if (!mgpu.swapchain->reconfigure(OPTIONS)) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
+                    return false;
+                }
+
+                auto                         NEWAQBUF = mgpu.swapchain->next(nullptr);
+                SP<Aquamarine::CDRMRenderer> primaryRenderer;
+                if (backend->primary)
+                    primaryRenderer = backend->primary->rendererState.renderer;
+                auto blitResult = backend->rendererState.renderer->blit(
+                    STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+                if (!blitResult.success) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+                    return false;
+                }
+
+                // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
+                // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
+                static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+                if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
+                    state->setExplicitInFence(blitResult.syncFD.value());
+                else
+                    state->setExplicitInFence(-1);
+
+                drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
+            }
         } else
             drmFB = CDRMFB::create(STATE.buffer, backend, nullptr); // will return attachment if present
 
@@ -2058,6 +2118,23 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             .presented = backend->sessionActive(),
             .when      = &presented,
             .seq       = 0, /* unknown sequence for tearing */
+            .refresh   = (int)(connector->refresh ? (1000000000000LL / connector->refresh) : 0),
+            .flags     = flags,
+        });
+
+        connector->onPresent();
+    } else if ((data.flags & DRM_MODE_PAGE_FLIP_EVENT) && !connector->isPageFlipPending) {
+        // page flip was requested but never queued (e.g. drmModeSetCrtc displayed
+        // the buffer synchronously), emit present so the compositor keeps rendering
+        uint32_t flags = IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK | IOutput::AQ_OUTPUT_PRESENT_ZEROCOPY;
+
+        timespec presented;
+        clock_gettime(CLOCK_MONOTONIC, &presented);
+
+        connector->output->events.present.emit(IOutput::SPresentEvent{
+            .presented = backend->sessionActive(),
+            .when      = &presented,
+            .seq       = 0,
             .refresh   = (int)(connector->refresh ? (1000000000000LL / connector->refresh) : 0),
             .flags     = flags,
         });
